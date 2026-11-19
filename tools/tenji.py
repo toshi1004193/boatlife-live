@@ -12,6 +12,7 @@
     python tenji.py 20261113 08 1     → 常滑(08)1Rのオリジナル展示データを取って表示
 """
 
+import datetime
 import re
 import sys
 import urllib.error
@@ -27,6 +28,8 @@ _GROUP = "https://{host}/modules/yosou/group-cyokuzen.php?day={{d}}&race={{r}}&k
 SOURCES = {
     "01": ("https://www.kiryu-kyotei.com/modules/yosou/cyokuzen.php?day={d}&race={r}", "html"),
     "02": ("https://www.boatrace-toda.jp/xml/kaisai/{d}/race_table_original_{rr}.xml", "toda"),
+    # 平和島・丸亀は「競技情報」のページ(日付がなく、その日の分しか見られない)。2026/11/19 に追加
+    "04": ("https://www.heiwajima.gr.jp/asp/kyogi/04/pc/yoso05{rr}.htm", "kyogi"),
     "06": (_GROUP.format(host="www.boatrace-hamanako.jp"), "html"),
     "08": (_GROUP.format(host="www.boatrace-tokoname.jp"), "html"),
     "09": ("https://www.boatrace-tsu.com/modules/yosou/group-tenji.php?day={d}&race={r}&kind=1", "html"),
@@ -34,6 +37,7 @@ SOURCES = {
     "11": ("https://www.boatrace-biwako.jp/modules/yosou/cyokuzen.php?day={d}&race={r}&if=0&kind=2", "html"),
     "13": (_GROUP.format(host="www.boatrace-amagasaki.jp"), "html"),
     "14": (_GROUP.format(host="www.n14.jp"), "html"),
+    "15": ("https://www.marugameboat.jp/asp/kyogi/15/pc/yoso05{rr}.htm", "kyogi"),
     "19": (_GROUP.format(host="www.boatrace-shimonoseki.jp"), "html"),
     "20": (_GROUP.format(host="www.wmb.jp"), "html"),
     "21": (_GROUP.format(host="www.boatrace-ashiya.com"), "html"),
@@ -117,11 +121,55 @@ def parse_toda(xml: str) -> dict | None:
     return {"項目": {"一周": "一周", "まわり足": "まわり足", "直線": "直線"}, "艇": boats}
 
 
+_TWO = re.compile(r"^\d{1,2}\.\d\d$")
+
+
+def parse_kyogi(html: str) -> dict | None:
+    """
+    平和島・丸亀などの「競技情報」のページ。展示タイムと一周の間に体重などの列がある場もあるので、
+    展示タイムより後ろで最初に出てくる「小数2けた」の値から、見出しの順に3つ読む。
+    3つとも小数2けたでなければ(「-」で計れなかったなど)、その艇は空にする(ずれて読まないように)。
+    ページの JS 版(cf/functions/api/live.js の parseKyogi)と同じ読み方。
+    """
+    at = html.find("まわり足")
+    if at < 0:
+        return None
+    table = html[html.rfind("<table", 0, at):html.find("</table>", at)]
+    he = table.find("</thead>")
+    if he < 0:
+        return None
+    head = _text(table[:he])
+    names = [w for _, w in sorted((head.find(w), w) for w in _LABELS if w in head)]
+    if len(names) != 3:
+        return None
+    boats = {}
+    for body in table[he:].split("<tbody")[1:]:
+        tr = _TR.search(body)
+        if not tr:
+            continue
+        cells = [_text(c) for c in _TD.findall(tr.group(1))]
+        if not cells or cells[0] not in ("1", "2", "3", "4", "5", "6"):
+            continue
+        ex = next((i for i, c in enumerate(cells[1:], 1) if _EXHIBIT.match(c) and 5.5 <= float(c) <= 8.0), None)
+        if ex is None:
+            continue
+        rest = cells[ex + 1:]
+        first = next((i for i, c in enumerate(rest) if _TWO.match(c)), None)
+        three = rest[first:first + 3] if first is not None else []
+        ok = len(three) == 3 and all(_TWO.match(c) for c in three)
+        boats[cells[0]] = {_LABELS[n]: (_num(three[j], _LABELS[n]) if ok else None) for j, n in enumerate(names)}
+    if len(boats) < 5 or all(v is None for b in boats.values() for v in b.values()):
+        return None
+    return {"項目": {_LABELS[n]: n for n in names}, "艇": boats}
+
+
 def fetch_original(date: str, jcd: str, rno: int) -> dict | None:
     """そのレースのオリジナル展示データ。対応していない場・まだ出ていないときは None。"""
     if jcd not in SOURCES:
         return None
     url, kind = SOURCES[jcd]
+    if kind == "kyogi" and date != f"{datetime.date.today():%Y%m%d}":
+        return None                   # 日付のないページなので、今日の分しか取れない
     url = url.format(d=date, r=rno, rr=f"{rno:02d}")
     req = urllib.request.Request(url, headers=UA)
     try:
@@ -131,7 +179,9 @@ def fetch_original(date: str, jcd: str, rno: int) -> dict | None:
         if e.code == 404:             # まだ展示前(戸田は展示が終わるまでファイルがない)
             return None
         raise
-    return parse_toda(body) if kind == "toda" else parse_html(body)
+    if kind == "toda":
+        return parse_toda(body)
+    return parse_kyogi(body) if kind == "kyogi" else parse_html(body)
 
 
 if __name__ == "__main__":
